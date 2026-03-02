@@ -461,6 +461,7 @@ Add the server to your Claude Desktop configuration:
 - **getGoogleDocContent** - Get document content with text indices for formatting
   - `documentId`: Document ID
   - `includeFormatting`: Include font, style, and color info for each text span (optional, default: false)
+  - `viewFormattingDetail`: Include structured JSON formatting metadata for each text span (optional, default: false)
 
 - **listDocumentTabs** - List all tabs in a Google Doc with their IDs and hierarchy
   - `documentId`: Document ID

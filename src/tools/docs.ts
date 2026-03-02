@@ -436,6 +436,7 @@ const UpdateGoogleDocSchema = z.object({
 const GetGoogleDocContentSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
   includeFormatting: z.boolean().optional(),
+  viewFormattingDetail: z.boolean().optional(),
 });
 
 const InsertTextSchema = z.object({
@@ -869,6 +870,7 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         documentId: { type: "string", description: "Document ID" },
         includeFormatting: { type: "boolean", description: "Include font, style, and color info for each text span (default: false)" },
+        viewFormattingDetail: { type: "boolean", description: "Include structured JSON formatting metadata for each text span (default: false)" },
       },
       required: ["documentId"]
     }
@@ -1164,7 +1166,8 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         return errorResponse(validation.error.errors[0].message);
       }
       const a = validation.data;
-      const withFormatting = a.includeFormatting === true;
+      const withFormatting = a.includeFormatting === true || a.viewFormattingDetail === true;
+      const withFormattingDetail = a.viewFormattingDetail === true;
 
       const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
       const document = await docs.documents.get({
@@ -1284,6 +1287,27 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         }
       }
 
+      interface FormattingTabDetail { title: string; segments: Segment[] }
+      const formattingDetails: FormattingTabDetail[] = [];
+      function trackFormattingDetails(title: string, segments: Segment[]) {
+        if (!withFormattingDetail) return;
+        formattingDetails.push({
+          title,
+          segments: segments.map(seg => ({ ...seg }))
+        });
+      }
+
+      function buildFontSummary() {
+        return [...fontUsage.entries()]
+          .sort((a, b) => b[1].charCount - a[1].charCount)
+          .map(([fontFamily, info]) => ({
+            fontFamily,
+            sizes: [...info.sizes].sort((a, b) => a - b),
+            styles: [...info.styles].sort(),
+            charCount: info.charCount,
+          }));
+      }
+
       const tabs = (document.data as any).tabs as any[] | undefined;
       let formattedContent = 'Document content with indices:\n\n';
       let totalLength = 0;
@@ -1297,6 +1321,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
           if (bodyContent) {
             const segments = extractSegments(bodyContent);
             trackFonts(segments);
+            trackFormattingDetails(title, segments);
             formattedContent += formatSegments(segments);
             if (segments.length > 0) {
               totalLength += segments[segments.length - 1].endIndex;
@@ -1310,6 +1335,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         if (bodyContent) {
           const segments = extractSegments(bodyContent);
           trackFonts(segments);
+          trackFormattingDetails(tabs[0].tabProperties?.title || 'Untitled', segments);
           formattedContent += formatSegments(segments);
           totalLength = segments.length > 0 ? segments[segments.length - 1].endIndex : 0;
         }
@@ -1319,6 +1345,7 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         if (bodyContent) {
           const segments = extractSegments(bodyContent);
           trackFonts(segments);
+          trackFormattingDetails(document.data.title || 'Document', segments);
           formattedContent += formatSegments(segments);
           totalLength = segments.length > 0 ? segments[segments.length - 1].endIndex : 0;
         }
@@ -1332,6 +1359,14 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
           const stylesStr = info.styles.size > 0 ? [...info.styles].sort().join(', ') : 'normal';
           formattedContent += `${font}: sizes [${sizesStr}], styles [${stylesStr}], ~${info.charCount} chars\n`;
         }
+      }
+
+      if (withFormattingDetail) {
+        formattedContent += '\n--- Formatting detail (JSON) ---\n';
+        formattedContent += JSON.stringify({
+          tabs: formattingDetails,
+          fonts: buildFontSummary(),
+        }, null, 2) + '\n';
       }
 
       return {

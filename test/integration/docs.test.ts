@@ -227,11 +227,35 @@ describe('Docs tools', () => {
 
   // --- formatGoogleDocText / formatGoogleDocParagraph aliases ---
   describe('format alias tools', () => {
+    it('formatGoogleDocText schema includes fontFamily', async () => {
+      const tools = await ctx.client.listTools();
+      const tool = tools.tools.find(t => t.name === 'formatGoogleDocText');
+      assert.ok(tool);
+      assert.ok((tool as any).inputSchema?.properties?.fontFamily);
+    });
+
     it('formatGoogleDocText delegates successfully', async () => {
       const res = await callTool(ctx.client, 'formatGoogleDocText', {
         documentId: 'doc-1', startIndex: 1, endIndex: 5, bold: true,
       });
       assert.equal(res.isError, false);
+    });
+
+    it('formatGoogleDocText applies fontFamily', async () => {
+      const res = await callTool(ctx.client, 'formatGoogleDocText', {
+        documentId: 'doc-1',
+        startIndex: 1,
+        endIndex: 5,
+        fontFamily: 'Verdana',
+      });
+      assert.equal(res.isError, false);
+
+      const calls = ctx.mocks.docs.tracker.getCalls('documents.batchUpdate');
+      assert.ok(calls.length > 0);
+
+      const request = calls[calls.length - 1].args[0]?.requestBody?.requests?.[0]?.updateTextStyle;
+      assert.equal(request?.textStyle?.weightedFontFamily?.fontFamily, 'Verdana');
+      assert.ok(request?.fields?.split(',').includes('weightedFontFamily'));
     });
 
     it('formatGoogleDocParagraph delegates successfully', async () => {
@@ -383,6 +407,13 @@ describe('Docs tools', () => {
   // --- deleteComment ---
   // --- getGoogleDocContent ---
   describe('getGoogleDocContent', () => {
+    it('schema includes viewFormattingDetail', async () => {
+      const tools = await ctx.client.listTools();
+      const tool = tools.tools.find(t => t.name === 'getGoogleDocContent');
+      assert.ok(tool);
+      assert.ok((tool as any).inputSchema?.properties?.viewFormattingDetail);
+    });
+
     it('reads multi-tab document', async () => {
       ctx.mocks.docs.service.documents.get._setImpl(async () => ({
         data: {
@@ -565,6 +596,51 @@ describe('Docs tools', () => {
       assert.ok(text.includes('style=bold'), 'should show bold in Tab2');
       assert.ok(text.includes('--- Fonts summary ---'), 'should include fonts summary');
       assert.ok(text.includes('Georgia: sizes [10, 14 pt], styles [bold, italic]'), 'fonts summary should aggregate Georgia with sizes and styles');
+    });
+
+    it('includes JSON formatting detail when viewFormattingDetail is true', async () => {
+      ctx.mocks.docs.service.documents.get._setImpl(async () => ({
+        data: {
+          documentId: 'doc-1',
+          title: 'Styled Doc',
+          tabs: [
+            {
+              tabProperties: { title: 'Main' },
+              documentTab: {
+                body: {
+                  content: [{
+                    paragraph: {
+                      elements: [{
+                        textRun: {
+                          content: 'Styled text\n',
+                          textStyle: {
+                            italic: true,
+                            weightedFontFamily: { fontFamily: 'Arial' },
+                            fontSize: { magnitude: 12 },
+                          },
+                        },
+                        startIndex: 1,
+                        endIndex: 13,
+                      }],
+                    },
+                  }],
+                },
+              },
+            },
+          ],
+        },
+      }));
+
+      const res = await callTool(ctx.client, 'getGoogleDocContent', {
+        documentId: 'doc-1',
+        viewFormattingDetail: true,
+      });
+      assert.equal(res.isError, false);
+      const text = res.content[0].text;
+      assert.ok(text.includes('font="Arial"'));
+      assert.ok(text.includes('--- Formatting detail (JSON) ---'));
+      assert.ok(text.includes('"tabs": ['));
+      assert.ok(text.includes('"fontFamily": "Arial"'));
     });
 
     it('includes tab headers only when multiple tabs', async () => {

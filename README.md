@@ -145,7 +145,7 @@ npx @piotr-agier/google-drive-mcp auth
    ```bash
    # Copy the example file
    cp gcp-oauth.keys.example.json gcp-oauth.keys.json
-   
+
    # Edit gcp-oauth.keys.json with your OAuth client ID
    ```
 
@@ -153,7 +153,7 @@ npx @piotr-agier/google-drive-mcp auth
    ```bash
    npm run auth
    ```
-   
+
    Note: Authentication happens automatically on first run of an MCP client if you skip this step.
 
 ## Docker Usage
@@ -164,7 +164,7 @@ npx @piotr-agier/google-drive-mcp auth
    ```bash
    # Using npx
    npx @piotr-agier/google-drive-mcp auth
-   
+
    # Or using local installation
    npm run auth
    ```
@@ -240,13 +240,20 @@ Add this configuration to use the Docker container with Claude Desktop:
 
 The server supports multiple methods for providing OAuth credentials (in order of priority):
 
-#### 1. **Environment Variable** (Recommended)
+#### 1. **Environment Variable** (Highest Priority)
 ```bash
 export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/path/to/your/gcp-oauth.keys.json"
 ```
 
-#### 2. **Default File Location**
-Place `gcp-oauth.keys.json` in the project root directory
+#### 2. **Config Directory** (Recommended)
+Place `gcp-oauth.keys.json` in the XDG config directory:
+```
+~/.config/google-drive-mcp/gcp-oauth.keys.json
+```
+This is the recommended location — it works reliably with `npx`, global installs, and local setups.
+
+#### 3. **Project Root** (Legacy Fallback)
+Place `gcp-oauth.keys.json` in the project root directory. This still works for local development but is unreliable with `npx` or global installs.
 
 ### OAuth Scope Configuration
 
@@ -322,9 +329,10 @@ Add the server to your Claude Desktop configuration:
 
 ### Search and Navigation
 - **search** - Search for files across Google Drive
-  - `query`: Search terms
+  - `query`: Search terms (or raw Drive API query when `rawQuery=true`)
   - `pageSize`: Number of results per page (optional, default 50, max 100)
   - `pageToken`: Pagination token for next page (optional)
+  - `rawQuery`: Pass `query` directly to the Drive API — enables operators like `modifiedTime`, `createdTime`, `mimeType`, `name contains`, etc. (optional)
 
 - **listFolder** - List contents of a folder
   - `folderId`: Folder ID (optional, defaults to root)
@@ -410,6 +418,11 @@ Add the server to your Claude Desktop configuration:
   - `name`: File name in Drive (optional, defaults to local filename)
   - `parentFolderId`: Parent folder ID or path (optional, e.g., '/Work/Projects')
   - `mimeType`: MIME type (optional, auto-detected from extension)
+  - `convertToGoogleFormat`: Convert uploaded file to native Google Workspace format (optional, default: false). When enabled, Office files are automatically converted:
+    - `.docx` / `.doc` → Google Doc
+    - `.xlsx` / `.xls` → Google Sheet
+    - `.pptx` / `.ppt` → Google Slides
+    - File extension is stripped from the name automatically (e.g., `report.docx` becomes `report`)
 
 - **downloadFile** - Download a Google Drive file to a local path
   - `fileId`: Google Drive file ID
@@ -529,6 +542,15 @@ Add the server to your Claude Desktop configuration:
 - **formatGoogleDocParagraph** - Alias for `applyParagraphStyle` (compatibility helper)
   - Same parameters as `applyParagraphStyle`
 
+#### Bullet Points and Lists
+- **createParagraphBullets** - Add or remove bullet points / numbered lists on paragraphs
+  - `documentId`: Document ID
+  - Target (use one): `startIndex`+`endIndex` OR `textToFind`+`matchInstance`
+  - `bulletPreset`: Bullet style preset (optional, default: `BULLET_DISC_CIRCLE_SQUARE`). Available presets:
+    - **Bullet styles**: `BULLET_DISC_CIRCLE_SQUARE`, `BULLET_DIAMONDX_ARROW3D_SQUARE`, `BULLET_CHECKBOX`, `BULLET_ARROW_DIAMOND_DISC`, `BULLET_STAR_CIRCLE_SQUARE`, `BULLET_ARROW3D_CIRCLE_SQUARE`, `BULLET_LEFTTRIANGLE_DIAMOND_DISC`
+    - **Numbered styles**: `NUMBERED_DECIMAL_ALPHA_ROMAN`, `NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS`, `NUMBERED_DECIMAL_NESTED`, `NUMBERED_UPPERALPHA_ALPHA_ROMAN`, `NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL`, `NUMBERED_ZERODECIMAL_ALPHA_ROMAN`
+    - **Remove bullets**: `NONE` — removes existing bullets/numbering from the targeted paragraphs
+
 - **findAndReplaceInDoc** - Find and replace text across a Google Doc
   - `documentId`: Document ID
   - `findText`: Text to find
@@ -565,11 +587,12 @@ Add the server to your Claude Desktop configuration:
   - `uploadToSameFolder`: Upload to same folder as document (optional, default: true)
 
 #### Comments
-- **listComments** - List all comments in a Google Document
+- **listComments** - List all comments in a Google Document with position context, character offsets, and full reply chains
   - `documentId`: Document ID
   - `includeDeleted`: Include deleted comments (optional, default: false)
   - `pageSize`: Max comments to return, 1-100 (optional, default: 100)
   - `pageToken`: Token for next page of results (optional)
+  - Returns surrounding context and Docs API character offsets for each comment using a two-tiered approach (Docs API text matching, DOCX export fallback for ambiguous matches)
 
 - **getComment** - Get a specific comment with its full thread of replies
   - `documentId`: Document ID
@@ -585,6 +608,7 @@ Add the server to your Claude Desktop configuration:
   - `documentId`: Document ID
   - `commentId`: Comment ID to reply to
   - `replyText`: The reply content
+  - `resolve`: Set to `true` to resolve the comment thread after replying (optional, default: false)
 
 - **deleteComment** - Delete a comment from the document
   - `documentId`: Document ID
@@ -926,15 +950,15 @@ After revoking access, you'll need to re-authenticate the next time you use the 
 #### "OAuth credentials not found"
 ```
 OAuth credentials not found. Please provide credentials using one of these methods:
-1. Environment variable:
+1. Config directory (recommended):
+   Place your gcp-oauth.keys.json file in: ~/.config/google-drive-mcp/
+2. Environment variable:
    export GOOGLE_DRIVE_OAUTH_CREDENTIALS="/path/to/gcp-oauth.keys.json"
-2. Default file path:
-   Place your gcp-oauth.keys.json file in the package root directory.
 ```
 
 **Solution:**
 - Download credentials from Google Cloud Console
-- Either set the environment variable or place the file in the project root
+- Place the file in `~/.config/google-drive-mcp/gcp-oauth.keys.json` (recommended), or set the environment variable
 - Ensure the file has proper read permissions
 
 #### "Authentication failed" or Browser doesn't open
@@ -978,7 +1002,7 @@ npx @piotr-agier/google-drive-mcp auth
 
 **Solution:**
 1. Go to [Google Account Permissions](https://myaccount.google.com/permissions)
-2. Find and remove access for "Google Drive MCP" 
+2. Find and remove access for "Google Drive MCP"
 3. Clear local tokens: `rm ~/.config/google-drive-mcp/tokens.json`
 4. Re-authenticate to grant all required scopes
 5. Verify the consent screen shows ALL scopes including full Drive access
@@ -1127,7 +1151,7 @@ npm run typecheck # Type checking without compilation
 - `npm run typecheck` - Run TypeScript type checking only
 - `npm run lint` - Run TypeScript type checking (alias for typecheck)
 - `npm run prepare` - Auto-runs build before npm publish
-- `npm test` - Run tests (placeholder - no tests implemented yet)
+- `npm test` - Run unit tests
 
 ## Advanced Configuration
 
@@ -1139,7 +1163,8 @@ npm run typecheck # Type checking without compilation
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `GOOGLE_DRIVE_OAUTH_CREDENTIALS` | Path to your OAuth credentials JSON file | `/home/user/secrets/oauth.json` |
-| *(or place file at)* | Default location: `gcp-oauth.keys.json` in project root | `./gcp-oauth.keys.json` |
+| *(or place file at)* | Config directory (recommended): `~/.config/google-drive-mcp/gcp-oauth.keys.json` | `~/.config/google-drive-mcp/gcp-oauth.keys.json` |
+| *(or place file at)* | Project root (legacy fallback): `gcp-oauth.keys.json` | `./gcp-oauth.keys.json` |
 
 **Optional** (for customization):
 | Variable | Description | Default | Example |

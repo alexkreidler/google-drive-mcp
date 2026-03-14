@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { createReadStream, existsSync } from 'fs';
 import { basename, extname } from 'path';
+import JSZip from 'jszip';
 import type { ToolDefinition, ToolContext, ToolResult } from '../types.js';
 import { errorResponse } from '../types.js';
 import { escapeDriveQuery } from '../utils.js';
@@ -36,6 +37,32 @@ function rgbColorToHex(color: any): string | null {
   const g = Math.round((rgb.green || 0) * 255);
   const b = Math.round((rgb.blue || 0) * 255);
   return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+}
+
+// Helper to recursively collect all tabs with their nesting level
+function collectAllTabsWithLevel(tabs: any[], level: number = 0): Array<{ tab: any; level: number }> {
+  const result: Array<{ tab: any; level: number }> = [];
+  for (const tab of tabs) {
+    result.push({ tab, level });
+    if (tab.childTabs && tab.childTabs.length > 0) {
+      result.push(...collectAllTabsWithLevel(tab.childTabs, level + 1));
+    }
+  }
+  return result;
+}
+
+// Helper to recursively find a tab by ID in the tab tree
+function findTabById(tabs: any[], targetId: string): any | null {
+  for (const tab of tabs) {
+    if (tab.tabProperties?.tabId === targetId) {
+      return tab;
+    }
+    if (tab.childTabs && tab.childTabs.length > 0) {
+      const found = findTabById(tab.childTabs, targetId);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 // Execute batch update for Google Docs
@@ -419,6 +446,341 @@ async function uploadImageToDriveHelper(
 }
 
 // ---------------------------------------------------------------------------
+// Comment context extraction helpers
+// ---------------------------------------------------------------------------
+
+/** Context extracted for a single comment (keyed by Drive API comment ID) */
+export interface CommentContext {
+  contextBefore?: string;
+  contextAfter?: string;
+  startIndex?: number;
+  endIndex?: number;
+}
+
+/** A segment of text with its Docs API startIndex */
+interface TextSegment {
+  text: string;
+  startIndex: number;
+}
+
+/** Result of building flat text from a Google Doc */
+interface FlatTextResult {
+  flatText: string;
+  offsetMap: number[];
+}
+
+// Guard against matching XML elements from distant/unrelated tables or paragraphs
+const MAX_ROW_XML_DISTANCE = 100_000;
+const MAX_PARAGRAPH_XML_DISTANCE = 50_000;
+const MAX_PARAGRAPH_CONTEXT_LENGTH = 300;
+
+/**
+ * Build flat text from a Google Doc, tracking each character's Docs API startIndex.
+ * Handles paragraphs, tables (including nested), and multi-tab docs.
+ */
+export function buildFlatTextFromDoc(docData: any): FlatTextResult {
+  function extractSegments(bodyContent: any[]): TextSegment[] {
+    const segs: TextSegment[] = [];
+    function fromElements(elements: any[]) {
+      for (const el of elements) {
+        if (el.textRun?.content && el.startIndex != null) {
+          segs.push({ text: el.textRun.content, startIndex: el.startIndex });
+        }
+      }
+    }
+    for (const el of bodyContent) {
+      if (el.paragraph?.elements) {
+        fromElements(el.paragraph.elements);
+      } else if (el.table) {
+        for (const row of el.table.tableRows || []) {
+          for (const cell of row.tableCells || []) {
+            for (const cc of cell.content || []) {
+              if (cc.paragraph?.elements) fromElements(cc.paragraph.elements);
+              if (cc.table) {
+                const nested = extractSegments([cc]);
+                segs.push(...nested);
+              }
+            }
+          }
+        }
+      }
+    }
+    return segs;
+  }
+
+  const allSegments: TextSegment[] = [];
+  const tabs = (docData as any).tabs as any[] | undefined;
+  if (tabs && tabs.length > 0) {
+    for (const tab of tabs) {
+      const bc = tab.documentTab?.body?.content;
+      if (bc) allSegments.push(...extractSegments(bc));
+    }
+  } else if (docData.body?.content) {
+    allSegments.push(...extractSegments(docData.body.content));
+  }
+
+  let flatText = '';
+  const offsetMap: number[] = [];
+  for (const seg of allSegments) {
+    for (let i = 0; i < seg.text.length; i++) {
+      offsetMap.push(seg.startIndex + i);
+      flatText += seg.text[i];
+    }
+  }
+
+  return { flatText, offsetMap };
+}
+
+/** Extract cell texts from a DOCX table row XML string */
+export function extractRowCells(rowXml: string): string[] {
+  const cells: string[] = [];
+  let searchFrom = 0;
+  while (true) {
+    const tcStart1 = rowXml.indexOf('<w:tc>', searchFrom);
+    const tcStart2 = rowXml.indexOf('<w:tc ', searchFrom);
+    const tcStart = (tcStart1 === -1 && tcStart2 === -1) ? -1 :
+      (tcStart1 === -1) ? tcStart2 : (tcStart2 === -1) ? tcStart1 : Math.min(tcStart1, tcStart2);
+    if (tcStart === -1) break;
+    const tcEnd = rowXml.indexOf('</w:tc>', tcStart);
+    if (tcEnd === -1) break;
+    const cellXml = rowXml.substring(tcStart, tcEnd);
+    const tTexts: string[] = [];
+    const tRegex = /<w:t[^>]*>([^<]*)<\/w:t>/g;
+    let t: RegExpExecArray | null;
+    while ((t = tRegex.exec(cellXml)) !== null) tTexts.push(t[1]);
+    if (tTexts.length > 0) cells.push(tTexts.join(''));
+    searchFrom = tcEnd + 7;
+  }
+  return cells;
+}
+
+/** DOCX comment info parsed from word/comments.xml */
+export interface DocxComment {
+  author: string;
+  date: string;
+  content: string;
+}
+
+/** Context extracted from DOCX comment ranges in document.xml */
+export interface DocxContextResult {
+  docxComments: Map<number, DocxComment>;
+  contextsBefore: Map<number, string>;
+  contextsAfter: Map<number, string>;
+  rowCells: Map<number, string[]>;
+}
+
+/**
+ * Parse a DOCX export to extract comment positions and surrounding context.
+ * Returns DOCX comment metadata and context maps keyed by DOCX comment ID.
+ */
+export async function resolveContextFromDocx(docxData: ArrayBuffer): Promise<DocxContextResult | null> {
+  const zip = await JSZip.loadAsync(docxData);
+  const commentsXml = await zip.file('word/comments.xml')?.async('string');
+  const documentXml = await zip.file('word/document.xml')?.async('string');
+
+  if (!commentsXml || !documentXml) return null;
+
+  // ── Parse word/comments.xml ──
+  const docxComments = new Map<number, DocxComment>();
+  const commentTagRegex = /<w:comment\s+[^>]*?w:id="(\d+)"[^>]*>/g;
+  let cMatch: RegExpExecArray | null;
+  while ((cMatch = commentTagRegex.exec(commentsXml)) !== null) {
+    const id = parseInt(cMatch[1]);
+    const tagStr = cMatch[0];
+    const authorMatch = tagStr.match(/w:author="([^"]*)"/);
+    const dateMatch = tagStr.match(/w:date="([^"]*)"/);
+    const author = authorMatch ? authorMatch[1] : '';
+    const date = dateMatch ? dateMatch[1] : '';
+
+    const endPos = commentsXml.indexOf('</w:comment>', cMatch.index);
+    if (endPos !== -1) {
+      const body = commentsXml.substring(cMatch.index, endPos);
+      const texts: string[] = [];
+      const tRegex = /<w:t[^>]*>([^<]*)<\/w:t>/g;
+      let tMatch: RegExpExecArray | null;
+      while ((tMatch = tRegex.exec(body)) !== null) {
+        texts.push(tMatch[1]);
+      }
+      docxComments.set(id, { author, date, content: texts.join('') });
+    }
+  }
+
+  // ── Parse document.xml for comment range context ──
+  const contextsBefore = new Map<number, string>();
+  const contextsAfter = new Map<number, string>();
+  const rowCells = new Map<number, string[]>();
+
+  const rangeStartRegex = /<w:commentRangeStart\s+w:id="(\d+)"\/>/g;
+  let rMatch: RegExpExecArray | null;
+  while ((rMatch = rangeStartRegex.exec(documentXml)) !== null) {
+    const docxId = parseInt(rMatch[1]);
+    const startPos = rMatch.index;
+
+    // Try table row context first (most comments in table-based docs)
+    const trStart = documentXml.lastIndexOf('<w:tr>', startPos);
+    const trEnd = documentXml.indexOf('</w:tr>', startPos);
+    if (trStart !== -1 && trEnd !== -1 && (startPos - trStart) < MAX_ROW_XML_DISTANCE) {
+      const rowXml = documentXml.substring(trStart, trEnd);
+
+      const cellTexts = extractRowCells(rowXml);
+      // Find which cell contains the comment marker
+      const commentMarker = `commentRangeStart w:id="${docxId}"`;
+      let commentCellIdx = -1;
+      let cellSearchFrom = 0;
+      for (let ci = 0; ci < cellTexts.length; ci++) {
+        // Walk through <w:tc> tags in order to match cell index with extractRowCells output
+        const tcStart1 = rowXml.indexOf('<w:tc>', cellSearchFrom);
+        const tcStart2 = rowXml.indexOf('<w:tc ', cellSearchFrom);
+        const tcStart = (tcStart1 === -1 && tcStart2 === -1) ? -1 :
+          (tcStart1 === -1) ? tcStart2 : (tcStart2 === -1) ? tcStart1 : Math.min(tcStart1, tcStart2);
+        if (tcStart === -1) break;
+        const tcEnd = rowXml.indexOf('</w:tc>', tcStart);
+        if (tcEnd === -1) break;
+        const cellXml = rowXml.substring(tcStart, tcEnd);
+        if (cellXml.includes(commentMarker)) {
+          commentCellIdx = ci;
+        }
+        cellSearchFrom = tcEnd + 7;
+      }
+
+      if (cellTexts.length > 0) {
+        const allTexts = cellTexts;
+        rowCells.set(docxId, allTexts);
+
+        if (commentCellIdx !== -1) {
+          const before = cellTexts.slice(0, commentCellIdx);
+          let after = cellTexts.slice(commentCellIdx + 1);
+
+          // If comment is in the last cell, grab the NEXT row for "after" context
+          if (commentCellIdx === cellTexts.length - 1) {
+            const nextTrStart = documentXml.indexOf('<w:tr>', trEnd);
+            const nextTrEnd = nextTrStart !== -1 ? documentXml.indexOf('</w:tr>', nextTrStart) : -1;
+            if (nextTrStart !== -1 && nextTrEnd !== -1) {
+              const nextRowXml = documentXml.substring(nextTrStart, nextTrEnd);
+              after = extractRowCells(nextRowXml);
+            }
+          }
+
+          const commentText = cellTexts[commentCellIdx];
+          contextsBefore.set(docxId, [...before, commentText].join(' | '));
+          contextsAfter.set(docxId, [commentText, ...after].join(' | '));
+        } else {
+          contextsBefore.set(docxId, allTexts.join(' | '));
+          contextsAfter.set(docxId, '');
+        }
+        continue;
+      }
+    }
+
+    // Paragraph fallback for non-table docs
+    const pStart = documentXml.lastIndexOf('<w:p ', startPos);
+    const pEnd = documentXml.indexOf('</w:p>', startPos);
+    if (pStart !== -1 && pEnd !== -1 && (startPos - pStart) < MAX_PARAGRAPH_XML_DISTANCE) {
+      const pXml = documentXml.substring(pStart, pEnd);
+      const pTexts: string[] = [];
+      const tRegex = /<w:t[^>]*>([^<]*)<\/w:t>/g;
+      let t: RegExpExecArray | null;
+      while ((t = tRegex.exec(pXml)) !== null) pTexts.push(t[1]);
+      const pText = pTexts.join('').trim();
+      if (pText) {
+        contextsBefore.set(docxId, pText.length > MAX_PARAGRAPH_CONTEXT_LENGTH
+          ? pText.substring(0, MAX_PARAGRAPH_CONTEXT_LENGTH) + '...' : pText);
+        contextsAfter.set(docxId, '');
+      }
+    }
+  }
+
+  return { docxComments, contextsBefore, contextsAfter, rowCells };
+}
+
+/**
+ * Match Drive API comments to DOCX comments by (author, createdTime).
+ * DOCX timestamps omit milliseconds, so we strip them from the API date.
+ * Populates the contextMap with matched context. Also resolves Docs API
+ * character offsets when flatText/offsetMap are available.
+ */
+export function matchDocxToDriveComments(
+  driveComments: any[],
+  docxResult: DocxContextResult,
+  contextMap: Map<string, CommentContext>,
+  flatText: string,
+  offsetMap: number[],
+): void {
+  const { docxComments, contextsBefore, contextsAfter } = docxResult;
+
+  for (const comment of driveComments) {
+    if (contextMap.has(comment.id)) continue; // already has Tier 1 context
+    if (comment.resolved) continue; // resolved comments not in DOCX
+
+    const apiAuthor = comment.author?.displayName || '';
+    const apiDate = (comment.createdTime || '').replace(/\.\d+Z$/, 'Z');
+
+    // Find matching DOCX comment
+    let matchedDocxId: number | null = null;
+    for (const [docxId, docxComment] of docxComments) {
+      if (docxComment.author === apiAuthor && docxComment.date === apiDate) {
+        matchedDocxId = docxId;
+        break;
+      }
+    }
+
+    if (matchedDocxId !== null) {
+      const ctxBefore = contextsBefore.get(matchedDocxId) || '';
+      const ctxAfter = contextsAfter.get(matchedDocxId) || '';
+      if (ctxBefore || ctxAfter) {
+        const entry: CommentContext = {
+          contextBefore: ctxBefore,
+          contextAfter: ctxAfter,
+        };
+
+        // Find Docs API character index using row context in flatText
+        const quoted = comment.quotedFileContent?.value;
+        if (quoted && flatText && offsetMap.length > 0 && ctxBefore) {
+          const beforePattern = ctxBefore.split(' | ').join('\n');
+
+          const findAll = (pattern: string): number[] => {
+            const results: number[] = [];
+            let from = 0;
+            while (true) {
+              const idx = flatText.indexOf(pattern, from);
+              if (idx === -1) break;
+              results.push(idx);
+              from = idx + 1;
+            }
+            return results;
+          };
+
+          let matches = findAll(beforePattern);
+
+          if (matches.length !== 1 && ctxAfter) {
+            const afterCells = ctxAfter.split(' | ');
+            const afterWithoutAnchor = afterCells.slice(1).join('\n');
+            if (afterWithoutAnchor) {
+              const fullPattern = beforePattern + '\n' + afterWithoutAnchor;
+              matches = findAll(fullPattern);
+            }
+          }
+
+          if (matches.length === 1) {
+            const patternStart = matches[0];
+            const qIdx = patternStart + beforePattern.length - quoted.length;
+            const endIdx = qIdx + quoted.length - 1;
+            if (endIdx < offsetMap.length && flatText.substring(qIdx, qIdx + quoted.length) === quoted) {
+              entry.startIndex = offsetMap[qIdx];
+              entry.endIndex = offsetMap[endIdx] + 1;
+            }
+          }
+        }
+
+        contextMap.set(comment.id, entry);
+      }
+      // Remove from map so duplicate timestamps (rare) don't double-match
+      docxComments.delete(matchedDocxId);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Zod schemas
 // ---------------------------------------------------------------------------
 
@@ -498,6 +860,30 @@ const ApplyParagraphStyleSchema = z.object({
   keepWithNext: z.boolean().optional()
 });
 
+const CreateParagraphBulletsSchema = z.object({
+  documentId: z.string().min(1, "Document ID is required"),
+  startIndex: z.number().int().min(1).optional(),
+  endIndex: z.number().int().min(1).optional(),
+  textToFind: z.string().min(1).optional(),
+  matchInstance: z.number().int().min(1).optional().default(1),
+  bulletPreset: z.enum([
+    'BULLET_DISC_CIRCLE_SQUARE',
+    'BULLET_DIAMONDX_ARROW3D_SQUARE',
+    'BULLET_CHECKBOX',
+    'BULLET_ARROW_DIAMOND_DISC',
+    'BULLET_STAR_CIRCLE_SQUARE',
+    'BULLET_ARROW3D_CIRCLE_SQUARE',
+    'BULLET_LEFTTRIANGLE_DIAMOND_DISC',
+    'NUMBERED_DECIMAL_ALPHA_ROMAN',
+    'NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS',
+    'NUMBERED_DECIMAL_NESTED',
+    'NUMBERED_UPPERALPHA_ALPHA_ROMAN',
+    'NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL',
+    'NUMBERED_ZERODECIMAL_ALPHA_ROMAN',
+    'NONE'
+  ]).default('BULLET_DISC_CIRCLE_SQUARE')
+});
+
 const ListCommentsSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
   includeDeleted: z.boolean().optional(),
@@ -520,7 +906,8 @@ const AddCommentSchema = z.object({
 const ReplyToCommentSchema = z.object({
   documentId: z.string().min(1, "Document ID is required"),
   commentId: z.string().min(1, "Comment ID is required"),
-  replyText: z.string().min(1, "Reply text is required")
+  replyText: z.string().min(1, "Reply text is required"),
+  resolve: z.boolean().optional().describe("Set to true to resolve the comment thread after replying")
 });
 
 const DeleteCommentSchema = z.object({
@@ -782,6 +1169,22 @@ export const toolDefinitions: ToolDefinition[] = [
     }
   },
   {
+    name: "createParagraphBullets",
+    description: "Add or remove bullet points / numbered lists on paragraphs in a Google Doc. Target paragraphs by startIndex+endIndex or textToFind. Use bulletPreset='NONE' to remove bullets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        documentId: { type: "string", description: "The document ID" },
+        startIndex: { type: "number", description: "Start index (1-based) - use with endIndex" },
+        endIndex: { type: "number", description: "End index (exclusive) - use with startIndex" },
+        textToFind: { type: "string", description: "Text within the target paragraph(s) to bulletize" },
+        matchInstance: { type: "number", description: "Which instance of textToFind (default: 1)" },
+        bulletPreset: { type: "string", enum: ["BULLET_DISC_CIRCLE_SQUARE", "BULLET_DIAMONDX_ARROW3D_SQUARE", "BULLET_CHECKBOX", "BULLET_ARROW_DIAMOND_DISC", "BULLET_STAR_CIRCLE_SQUARE", "BULLET_ARROW3D_CIRCLE_SQUARE", "BULLET_LEFTTRIANGLE_DIAMOND_DISC", "NUMBERED_DECIMAL_ALPHA_ROMAN", "NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS", "NUMBERED_DECIMAL_NESTED", "NUMBERED_UPPERALPHA_ALPHA_ROMAN", "NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL", "NUMBERED_ZERODECIMAL_ALPHA_ROMAN", "NONE"], description: "Bullet style preset. Use NONE to remove bullets. Default: BULLET_DISC_CIRCLE_SQUARE" }
+      },
+      required: ["documentId"]
+    }
+  },
+  {
     name: "findAndReplaceInDoc",
     description: "Find and replace text across a Google Document. Dry-run mode counts matches from paragraph text only (may differ from actual replacements which cover tables, headers, footers, etc.)",
     inputSchema: {
@@ -844,7 +1247,8 @@ export const toolDefinitions: ToolDefinition[] = [
       properties: {
         documentId: { type: "string", description: "The document ID" },
         commentId: { type: "string", description: "The comment ID to reply to" },
-        replyText: { type: "string", description: "The reply content" }
+        replyText: { type: "string", description: "The reply content" },
+        resolve: { type: "boolean", description: "Set to true to resolve the comment thread after replying (default: false)" }
       },
       required: ["documentId", "commentId", "replyText"]
     }
@@ -1288,12 +1692,17 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       let formattedContent = 'Document content with indices:\n\n';
       let totalLength = 0;
 
-      if (tabs && tabs.length > 1) {
-        // Multi-tab document
-        for (const tab of tabs) {
-          const title = tab.tabProperties?.title || 'Untitled';
+      if (tabs && tabs.length > 0) {
+        const allTabs = collectAllTabsWithLevel(tabs);
+        const isMultiTab = allTabs.length > 1;
+        for (const { tab, level } of allTabs) {
           const bodyContent = tab.documentTab?.body?.content;
-          formattedContent += `=== Tab: ${title} ===\n`;
+          // Multi-tab: include all tabs with headers
+          if (isMultiTab) {
+            const title = tab.tabProperties?.title || 'Untitled';
+            const indent = '  '.repeat(level);
+            formattedContent += `${indent}=== Tab: ${title} ===\n`;
+          }
           if (bodyContent) {
             const segments = extractSegments(bodyContent);
             trackFonts(segments);
@@ -1302,16 +1711,10 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
               totalLength += segments[segments.length - 1].endIndex;
             }
           }
-          formattedContent += '\n';
-        }
-      } else if (tabs && tabs.length === 1) {
-        // Single-tab document via tabs API
-        const bodyContent = tabs[0].documentTab?.body?.content;
-        if (bodyContent) {
-          const segments = extractSegments(bodyContent);
-          trackFonts(segments);
-          formattedContent += formatSegments(segments);
-          totalLength = segments.length > 0 ? segments[segments.length - 1].endIndex : 0;
+          // Multi-tab: add new line between tabs
+          if (isMultiTab) {
+            formattedContent += '\n';
+          }
         }
       } else {
         // Fallback to legacy body content
@@ -1468,8 +1871,8 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
 
       if (tabs && tabs.length > 0) {
         if (a.tabId) {
-          // Find the specific tab
-          const tab = tabs.find((t: any) => t.tabProperties?.tabId === a.tabId);
+          // Find the specific tab (recursively through childTabs)
+          const tab = findTabById(tabs, a.tabId);
           if (!tab) {
             return errorResponse(`Tab with ID "${a.tabId}" not found. Use listDocumentTabs to see available tabs.`);
           }
@@ -1477,22 +1880,24 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
           if (bodyContent) {
             text = extractText(bodyContent);
           }
-        } else if (tabs.length > 1) {
-          // Multi-tab: include all tabs with headers
-          for (const tab of tabs) {
-            const title = tab.tabProperties?.title || 'Untitled';
-            text += `=== Tab: ${title} ===\n`;
+        } else {
+          const allTabs = collectAllTabsWithLevel(tabs);
+          const isMultiTab = allTabs.length > 1;
+          for (const { tab, level } of allTabs) {
             const bodyContent = tab.documentTab?.body?.content;
+            // Multi-tab: include all tabs with headers
+            if (isMultiTab) {
+              const title = tab.tabProperties?.title || 'Untitled';
+              const indent = '  '.repeat(level);
+              text += `${indent}=== Tab: ${title} ===\n`;
+            }
             if (bodyContent) {
               text += extractText(bodyContent);
             }
-            text += '\n';
-          }
-        } else {
-          // Single tab via tabs API
-          const bodyContent = tabs[0].documentTab?.body?.content;
-          if (bodyContent) {
-            text = extractText(bodyContent);
+            // Multi-tab: add new line between tabs
+            if (isMultiTab) {
+              text += '\n';
+            }
           }
         }
       } else {
@@ -1741,6 +2146,73 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       };
     }
 
+
+    case "createParagraphBullets": {
+      const validation = CreateParagraphBulletsSchema.safeParse(args);
+      if (!validation.success) {
+        return errorResponse(validation.error.errors[0].message);
+      }
+      const a = validation.data;
+
+      let startIndex: number;
+      let endIndex: number;
+
+      if (a.startIndex !== undefined && a.endIndex !== undefined) {
+        startIndex = a.startIndex;
+        endIndex = a.endIndex;
+      } else if (a.textToFind !== undefined) {
+        const range = await findTextRange(
+          ctx,
+          a.documentId,
+          a.textToFind,
+          a.matchInstance || 1
+        );
+        if (!range) {
+          return errorResponse(`Text "${a.textToFind}" not found in document`);
+        }
+        startIndex = range.startIndex;
+        endIndex = range.endIndex;
+      } else {
+        return errorResponse("Must provide either startIndex+endIndex or textToFind");
+      }
+
+      const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
+
+      if (a.bulletPreset === 'NONE') {
+        await docs.documents.batchUpdate({
+          documentId: a.documentId,
+          requestBody: {
+            requests: [{
+              deleteParagraphBullets: {
+                range: { startIndex, endIndex }
+              }
+            }]
+          }
+        });
+        return {
+          content: [{ type: "text", text: `Removed bullets from range ${startIndex}-${endIndex}` }],
+          isError: false
+        };
+      }
+
+      await docs.documents.batchUpdate({
+        documentId: a.documentId,
+        requestBody: {
+          requests: [{
+            createParagraphBullets: {
+              range: { startIndex, endIndex },
+              bulletPreset: a.bulletPreset
+            }
+          }]
+        }
+      });
+
+      return {
+        content: [{ type: "text", text: `Applied ${a.bulletPreset} bullets to range ${startIndex}-${endIndex}` }],
+        isError: false
+      };
+    }
+
     case "findAndReplaceInDoc": {
       const validation = FindAndReplaceInDocSchema.safeParse(args);
       if (!validation.success) {
@@ -1806,10 +2278,9 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
       }
       const a = validation.data;
 
-      // Use Drive API v3 for comments
       const response = await ctx.getDrive().comments.list({
         fileId: a.documentId,
-        fields: 'comments(id,content,quotedFileContent,author,createdTime,resolved,replies),nextPageToken',
+        fields: 'comments(id,content,quotedFileContent,author,createdTime,resolved,replies(id,content,author,createdTime)),nextPageToken',
         pageSize: a.pageSize || 100,
         pageToken: a.pageToken,
         includeDeleted: a.includeDeleted || false,
@@ -1825,19 +2296,149 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         };
       }
 
-      // Format comments for display
+      // ── Comment context extraction (two-tiered) ──
+      // Tier 1 (fast): Read doc via Docs API, find each comment's quotedFileContent
+      //   in the body text. If there's exactly one match, extract surrounding context.
+      // Tier 2 (fallback): For ambiguous or failed Tier 1 comments, export as DOCX
+      //   and parse commentRangeStart/End XML markers. Match by (author, createdTime).
+      const contextMap = new Map<string, CommentContext>();
+      let flatText = '';
+      let offsetMap: number[] = [];
+
+      // ── Tier 1: Docs API text matching ──
+      // Check MIME type upfront — only Google Docs support the Docs API
+      let needsDocxFallback = false;
+      let isGoogleDoc = false;
+      try {
+        const fileInfo = await ctx.getDrive().files.get({
+          fileId: a.documentId,
+          fields: 'mimeType',
+          supportsAllDrives: true,
+        });
+        isGoogleDoc = fileInfo.data.mimeType === 'application/vnd.google-apps.document';
+      } catch (err) {
+        ctx.log('Failed to check file MIME type:', err);
+      }
+
+      if (isGoogleDoc) {
+        try {
+          const docs = ctx.google.docs({ version: 'v1', auth: ctx.authClient });
+          const docResponse = await docs.documents.get({
+            documentId: a.documentId,
+            includeTabsContent: true,
+          });
+
+          const result = buildFlatTextFromDoc(docResponse.data);
+          flatText = result.flatText;
+          offsetMap = result.offsetMap;
+
+          // Get surrounding context for a match at a flatText position
+          function getContext(matchStart: number, matchLen: number): { before: string; after: string } {
+            const matchText = flatText.substring(matchStart, matchStart + matchLen);
+            const beforeStart = Math.max(0, matchStart - 120);
+            let before = flatText.substring(beforeStart, matchStart).trim();
+            if (beforeStart > 0) before = '...' + before;
+            before = before + matchText;
+            const afterEnd = Math.min(flatText.length, matchStart + matchLen + 120);
+            let after = flatText.substring(matchStart + matchLen, afterEnd).trim();
+            if (afterEnd < flatText.length) after = after + '...';
+            after = matchText + after;
+            return { before, after };
+          }
+
+          // For each comment, find all occurrences of its quotedFileContent in the doc
+          const ambiguousComments: any[] = [];
+          for (const comment of comments) {
+            const quoted = comment.quotedFileContent?.value;
+            if (!quoted) continue;
+
+            const positions: number[] = [];
+            let searchFrom = 0;
+            while (true) {
+              const idx = flatText.indexOf(quoted, searchFrom);
+              if (idx === -1) break;
+              positions.push(idx);
+              searchFrom = idx + 1;
+            }
+
+            if (positions.length === 1) {
+              const surrounding = getContext(positions[0], quoted.length);
+              const entry: CommentContext = {
+                contextBefore: surrounding.before,
+                contextAfter: surrounding.after,
+              };
+              // Store Docs API character offsets with bounds check
+              const endIdx = positions[0] + quoted.length - 1;
+              if (endIdx < offsetMap.length) {
+                entry.startIndex = offsetMap[positions[0]];
+                entry.endIndex = offsetMap[endIdx] + 1;
+              }
+              if (comment.id) contextMap.set(comment.id, entry);
+            } else if (positions.length > 1) {
+              // Ambiguous — need DOCX fallback to disambiguate
+              ambiguousComments.push(comment);
+            }
+            // positions.length === 0: quoted text not found (e.g., doc was edited since comment)
+          }
+
+          needsDocxFallback = ambiguousComments.length > 0;
+        } catch (err) {
+          ctx.log('Tier 1 context extraction failed:', err);
+          needsDocxFallback = true;
+        }
+      }
+
+      // ── Tier 2: DOCX export fallback for ambiguous comments ──
+      if (needsDocxFallback) {
+        const unresolved = comments.filter((c: any) => !contextMap.has(c.id) && !c.resolved);
+
+        if (unresolved.length > 0) {
+          try {
+            const docxResponse = await ctx.getDrive().files.export({
+              fileId: a.documentId,
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            }, { responseType: 'arraybuffer' });
+
+            const docxResult = await resolveContextFromDocx(docxResponse.data as ArrayBuffer);
+            if (docxResult) {
+              matchDocxToDriveComments(comments, docxResult, contextMap, flatText, offsetMap);
+            }
+          } catch (err) {
+            ctx.log('Tier 2 DOCX context extraction failed:', err);
+          }
+        }
+      }
+
+      // ── Format comments for display ──
       const formattedComments = comments.map((comment: any, index: number) => {
-        const replies = comment.replies?.length || 0;
         const status = comment.resolved ? ' [RESOLVED]' : '';
         const author = comment.author?.displayName || 'Unknown';
         const date = comment.createdTime ? new Date(comment.createdTime).toLocaleDateString() : 'Unknown date';
-        const quotedText = comment.quotedFileContent?.value || 'No quoted text';
-        const anchor = quotedText !== 'No quoted text' ? ` (anchored to: "${quotedText.substring(0, 100)}${quotedText.length > 100 ? '...' : ''}")` : '';
+        const quotedText = comment.quotedFileContent?.value;
+        const commentCtx = contextMap.get(comment.id);
 
-        let result = `${index + 1}. ${author} (${date})${status}${anchor}\n   ${comment.content}`;
+        let positionInfo = '';
+        const indexStr = commentCtx?.startIndex != null
+          ? ` [chars ${commentCtx.startIndex}-${commentCtx.endIndex}]` : '';
 
-        if (replies > 0) {
-          result += `\n   └─ ${replies} ${replies === 1 ? 'reply' : 'replies'}`;
+        if (quotedText) {
+          const snippet = quotedText.length > 100 ? quotedText.substring(0, 100) + '...' : quotedText;
+          positionInfo = `\n   Anchored to: "${snippet}"${indexStr}`;
+        }
+        if (commentCtx) {
+          if (commentCtx.contextBefore) positionInfo += `\n   Context before: "${commentCtx.contextBefore}"`;
+          if (commentCtx.contextAfter) positionInfo += `\n   Context after: "${commentCtx.contextAfter}"`;
+        }
+
+        let result = `${index + 1}. ${author} (${date})${status}${positionInfo}\n   Comment: ${comment.content}`;
+
+        if (comment.replies && comment.replies.length > 0) {
+          for (const reply of comment.replies) {
+            const replyAuthor = reply.author?.displayName || 'Unknown';
+            const replyDate = reply.createdTime ? new Date(reply.createdTime).toLocaleDateString() : 'Unknown date';
+            const replyContent = reply.content || '(empty)';
+            result += `\n   └─ ${replyAuthor} (${replyDate}): ${replyContent}`;
+          }
         }
 
         result += `\n   Comment ID: ${comment.id}`;
@@ -1971,12 +2572,14 @@ export async function handleTool(toolName: string, args: Record<string, unknown>
         commentId: a.commentId,
         fields: 'id,content,author,createdTime',
         requestBody: {
-          content: a.replyText
+          content: a.replyText,
+          ...(a.resolve && { action: "resolve" })
         }
       });
 
+      const resolveNote = a.resolve ? ' Comment thread resolved.' : '';
       return {
-        content: [{ type: "text", text: `Reply added successfully. Reply ID: ${response.data.id}` }],
+        content: [{ type: "text", text: `Reply added successfully. Reply ID: ${response.data.id}${resolveNote}` }],
         isError: false
       };
     }

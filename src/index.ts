@@ -2,6 +2,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
@@ -10,9 +11,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from "googleapis";
 import type { drive_v3, calendar_v3 } from "googleapis";
+import { OAuth2Client } from 'google-auth-library';
 import { authenticate, AuthServer, initializeOAuth2Client } from './auth.js';
 import { fileURLToPath } from 'url';
 import { readFileSync } from 'fs';
+import { createServer } from 'http';
 import { join, dirname } from 'path';
 import {
   getExtensionFromFilename,
@@ -177,8 +180,27 @@ const server = new Server(
 // -----------------------------------------------------------------------------
 // AUTHENTICATION HELPER
 // -----------------------------------------------------------------------------
+
+/**
+ * Create an OAuth2Client from a raw access token (e.g. from Bearer header or env var).
+ * This bypasses the full OAuth flow — useful when a pre-authed token is available.
+ */
+function createClientFromAccessToken(accessToken: string): OAuth2Client {
+  const client = new OAuth2Client();
+  client.setCredentials({ access_token: accessToken });
+  return client;
+}
+
 async function ensureAuthenticated() {
   if (authClient) return;
+
+  // Check for a pre-provided access token (env var)
+  const envToken = process.env.GOOGLE_ACCESS_TOKEN;
+  if (envToken) {
+    log('Using GOOGLE_ACCESS_TOKEN from environment');
+    authClient = createClientFromAccessToken(envToken);
+    return;
+  }
 
   if (authenticationPromise) {
     log('Authentication already in progress, waiting...');
@@ -219,138 +241,140 @@ function buildToolContext(): ToolContext {
 // MCP REQUEST HANDLERS
 // -----------------------------------------------------------------------------
 
-server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
-  await ensureAuthenticated();
-  log('Handling ListResources request', { params: request.params });
-  const pageSize = 10;
-  const params: {
-    pageSize: number,
-    fields: string,
-    pageToken?: string,
-    q: string,
-    includeItemsFromAllDrives: boolean,
-    supportsAllDrives: boolean
-  } = {
-    pageSize,
-    fields: "nextPageToken, files(id, name, mimeType)",
-    q: `trashed = false`,
-    includeItemsFromAllDrives: true,
-    supportsAllDrives: true
-  };
+function registerHandlers(s: Server) {
+  s.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+    await ensureAuthenticated();
+    log('Handling ListResources request', { params: request.params });
+    const pageSize = 10;
+    const params: {
+      pageSize: number,
+      fields: string,
+      pageToken?: string,
+      q: string,
+      includeItemsFromAllDrives: boolean,
+      supportsAllDrives: boolean
+    } = {
+      pageSize,
+      fields: "nextPageToken, files(id, name, mimeType)",
+      q: `trashed = false`,
+      includeItemsFromAllDrives: true,
+      supportsAllDrives: true
+    };
 
-  if (request.params?.cursor) {
-    params.pageToken = request.params.cursor;
-  }
-
-  const res = await getDrive().files.list(params);
-  log('Listed files', { count: res.data.files?.length });
-  const files = res.data.files || [];
-
-  return {
-    resources: files.map((file: drive_v3.Schema$File) => ({
-      uri: `gdrive:///${file.id}`,
-      mimeType: file.mimeType || 'application/octet-stream',
-      name: file.name || 'Untitled',
-    })),
-    nextCursor: res.data.nextPageToken,
-  };
-});
-
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  await ensureAuthenticated();
-  log('Handling ReadResource request', { uri: request.params.uri });
-  const fileId = request.params.uri.replace("gdrive:///", "");
-
-  const file = await getDrive().files.get({
-    fileId,
-    fields: "mimeType",
-    supportsAllDrives: true
-  });
-  const mimeType = file.data.mimeType;
-
-  if (!mimeType) {
-    throw new Error("File has no MIME type.");
-  }
-
-  if (mimeType.startsWith("application/vnd.google-apps")) {
-    let exportMimeType;
-    switch (mimeType) {
-      case "application/vnd.google-apps.document": exportMimeType = "text/markdown"; break;
-      case "application/vnd.google-apps.spreadsheet": exportMimeType = "text/csv"; break;
-      case "application/vnd.google-apps.presentation": exportMimeType = "text/plain"; break;
-      case "application/vnd.google-apps.drawing": exportMimeType = "image/png"; break;
-      default: exportMimeType = "text/plain"; break;
+    if (request.params?.cursor) {
+      params.pageToken = request.params.cursor;
     }
 
-    const res = await getDrive().files.export(
-      { fileId, mimeType: exportMimeType },
-      { responseType: "text" },
-    );
+    const res = await getDrive().files.list(params);
+    log('Listed files', { count: res.data.files?.length });
+    const files = res.data.files || [];
 
-    log('Successfully read resource', { fileId, mimeType });
     return {
-      contents: [
-        {
-          uri: request.params.uri,
-          mimeType: exportMimeType,
-          text: res.data,
-        },
-      ],
+      resources: files.map((file: drive_v3.Schema$File) => ({
+        uri: `gdrive:///${file.id}`,
+        mimeType: file.mimeType || 'application/octet-stream',
+        name: file.name || 'Untitled',
+      })),
+      nextCursor: res.data.nextPageToken,
     };
-  } else {
-    const res = await getDrive().files.get(
-      { fileId, alt: "media", supportsAllDrives: true },
-      { responseType: "arraybuffer" },
-    );
-    const contentMime = mimeType || "application/octet-stream";
+  });
 
-    if (contentMime.startsWith("text/") || contentMime === "application/json") {
+  s.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    await ensureAuthenticated();
+    log('Handling ReadResource request', { uri: request.params.uri });
+    const fileId = request.params.uri.replace("gdrive:///", "");
+
+    const file = await getDrive().files.get({
+      fileId,
+      fields: "mimeType",
+      supportsAllDrives: true
+    });
+    const mimeType = file.data.mimeType;
+
+    if (!mimeType) {
+      throw new Error("File has no MIME type.");
+    }
+
+    if (mimeType.startsWith("application/vnd.google-apps")) {
+      let exportMimeType;
+      switch (mimeType) {
+        case "application/vnd.google-apps.document": exportMimeType = "text/markdown"; break;
+        case "application/vnd.google-apps.spreadsheet": exportMimeType = "text/csv"; break;
+        case "application/vnd.google-apps.presentation": exportMimeType = "text/plain"; break;
+        case "application/vnd.google-apps.drawing": exportMimeType = "image/png"; break;
+        default: exportMimeType = "text/plain"; break;
+      }
+
+      const res = await getDrive().files.export(
+        { fileId, mimeType: exportMimeType },
+        { responseType: "text" },
+      );
+
+      log('Successfully read resource', { fileId, mimeType });
       return {
         contents: [
           {
             uri: request.params.uri,
-            mimeType: contentMime,
-            text: Buffer.from(res.data as ArrayBuffer).toString("utf-8"),
+            mimeType: exportMimeType,
+            text: res.data,
           },
         ],
       };
     } else {
-      return {
-        contents: [
-          {
-            uri: request.params.uri,
-            mimeType: contentMime,
-            blob: Buffer.from(res.data as ArrayBuffer).toString("base64"),
-          },
-        ],
-      };
+      const res = await getDrive().files.get(
+        { fileId, alt: "media", supportsAllDrives: true },
+        { responseType: "arraybuffer" },
+      );
+      const contentMime = mimeType || "application/octet-stream";
+
+      if (contentMime.startsWith("text/") || contentMime === "application/json") {
+        return {
+          contents: [
+            {
+              uri: request.params.uri,
+              mimeType: contentMime,
+              text: Buffer.from(res.data as ArrayBuffer).toString("utf-8"),
+            },
+          ],
+        };
+      } else {
+        return {
+          contents: [
+            {
+              uri: request.params.uri,
+              mimeType: contentMime,
+              blob: Buffer.from(res.data as ArrayBuffer).toString("base64"),
+            },
+          ],
+        };
+      }
     }
-  }
-});
+  });
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: domainModules.flatMap(m => m.toolDefinitions),
-  };
-});
+  s.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: domainModules.flatMap(m => m.toolDefinitions),
+    };
+  });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  await ensureAuthenticated();
-  log('Handling tool request', { tool: request.params.name });
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    await ensureAuthenticated();
+    log('Handling tool request', { tool: request.params.name });
 
-  const ctx = buildToolContext();
+    const ctx = buildToolContext();
 
-  try {
-    for (const mod of domainModules) {
-      const result = await mod.handleTool(request.params.name, request.params.arguments ?? {}, ctx);
-      if (result !== null) return result;
+    try {
+      for (const mod of domainModules) {
+        const result = await mod.handleTool(request.params.name, request.params.arguments ?? {}, ctx);
+        if (result !== null) return result;
+      }
+      return errorResponse("Tool not found");
+    } catch (error) {
+      log('Error in tool request handler', { error: (error as Error).message });
+      return errorResponse((error as Error).message);
     }
-    return errorResponse("Tool not found");
-  } catch (error) {
-    log('Error in tool request handler', { error: (error as Error).message });
-    return errorResponse((error as Error).message);
-  }
-});
+  });
+}
 
 // -----------------------------------------------------------------------------
 // CLI FUNCTIONS
@@ -361,7 +385,7 @@ function showHelp(): void {
 Google Drive MCP Server v${VERSION}
 
 Usage:
-  npx @yourusername/google-drive-mcp [command]
+  npx @yourusername/google-drive-mcp [command] [options]
 
 Commands:
   auth     Run the authentication flow
@@ -369,13 +393,20 @@ Commands:
   version  Show version information
   help     Show this help message
 
+Options:
+  --transport <stdio|http>   Transport type (default: stdio)
+  --port <number>            HTTP server port (default: 3001)
+
 Examples:
   npx @yourusername/google-drive-mcp auth
   npx @yourusername/google-drive-mcp start
-  npx @yourusername/google-drive-mcp version
+  npx @yourusername/google-drive-mcp --transport http --port 8080
   npx @yourusername/google-drive-mcp
 
 Environment Variables:
+  GOOGLE_ACCESS_TOKEN              Pre-authenticated Google access token (skips OAuth)
+  GOOGLE_DRIVE_MCP_TRANSPORT       Transport type: "stdio" (default) or "http"
+  GOOGLE_DRIVE_MCP_PORT            HTTP server port (default: 3001)
   GOOGLE_DRIVE_OAUTH_CREDENTIALS   Path to OAuth credentials file
   GOOGLE_DRIVE_MCP_TOKEN_PATH      Path to store authentication tokens
 `);
@@ -423,9 +454,11 @@ async function runAuthServer(): Promise<void> {
 // MAIN EXECUTION
 // -----------------------------------------------------------------------------
 
-function parseCliArgs(): { command: string | undefined } {
+function parseCliArgs(): { command: string | undefined; transport: string; port: number } {
   const args = process.argv.slice(2);
   let command: string | undefined;
+  let transport = process.env.GOOGLE_DRIVE_MCP_TRANSPORT || 'stdio';
+  let port = parseInt(process.env.GOOGLE_DRIVE_MCP_PORT || '3001', 10);
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -435,17 +468,116 @@ function parseCliArgs(): { command: string | undefined } {
       continue;
     }
 
+    if (arg === '--transport' && i + 1 < args.length) {
+      transport = args[++i];
+      continue;
+    }
+
+    if (arg === '--port' && i + 1 < args.length) {
+      port = parseInt(args[++i], 10);
+      continue;
+    }
+
     if (!command && !arg.startsWith('--')) {
       command = arg;
       continue;
     }
   }
 
-  return { command };
+  return { command, transport, port };
+}
+
+async function startHttpServer(port: number) {
+  // Map of session ID -> transport for stateful sessions
+  const transports = new Map<string, StreamableHTTPServerTransport>();
+
+  const httpServer = createServer(async (req, res) => {
+    const url = new URL(req.url || '/', `http://localhost:${port}`);
+
+    // Only handle /mcp path
+    if (url.pathname !== '/mcp') {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
+    // Extract Bearer token from Authorization header for per-request auth
+    const authHeader = req.headers['authorization'];
+    if (authHeader?.startsWith('Bearer ')) {
+      const token = authHeader.slice(7);
+      authClient = createClientFromAccessToken(token);
+      // Invalidate cached services so they pick up the new client
+      _drive = null;
+      _calendar = null;
+      _lastAuthClient = null;
+    }
+
+    // Check for existing session
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (sessionId && transports.has(sessionId)) {
+      const transport = transports.get(sessionId)!;
+      await transport.handleRequest(req, res);
+      return;
+    }
+
+    // For new sessions (POST without session ID or initialization)
+    if (req.method === 'POST') {
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => crypto.randomUUID(),
+      });
+
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          transports.delete(transport.sessionId);
+        }
+      };
+
+      // Connect a new server instance for this session
+      const sessionServer = new Server(
+        { name: "google-drive-mcp", version: VERSION },
+        { capabilities: { resources: {}, tools: {} } },
+      );
+
+      // Register the same handlers on the session server
+      registerHandlers(sessionServer);
+
+      await sessionServer.connect(transport);
+      await transport.handleRequest(req, res);
+
+      // Session ID is assigned during handleRequest (initialization)
+      if (transport.sessionId) {
+        transports.set(transport.sessionId, transport);
+      }
+      return;
+    }
+
+    // Reject other methods without valid session
+    if (req.method === 'DELETE') {
+      res.writeHead(405);
+      res.end('Method not allowed');
+      return;
+    }
+
+    res.writeHead(400);
+    res.end('Bad request - no valid session');
+  });
+
+  httpServer.listen(port, () => {
+    console.error(`Google Drive MCP server (HTTP) listening on http://localhost:${port}/mcp`);
+  });
+
+  process.on("SIGINT", () => {
+    httpServer.close();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    httpServer.close();
+    process.exit(0);
+  });
 }
 
 async function main() {
-  const { command } = parseCliArgs();
+  const { command, transport: transportType, port } = parseCliArgs();
 
   switch (command) {
     case "auth":
@@ -454,19 +586,25 @@ async function main() {
     case "start":
     case undefined:
       try {
-        console.error("Starting Google Drive MCP server...");
-        const transport = new StdioServerTransport();
-        await server.connect(transport);
-        log('Server started successfully');
+        if (transportType === 'http') {
+          console.error("Starting Google Drive MCP server (HTTP)...");
+          await startHttpServer(port);
+        } else {
+          console.error("Starting Google Drive MCP server (stdio)...");
+          const transport = new StdioServerTransport();
+          registerHandlers(server);
+          await server.connect(transport);
+          log('Server started successfully');
 
-        process.on("SIGINT", async () => {
-          await server.close();
-          process.exit(0);
-        });
-        process.on("SIGTERM", async () => {
-          await server.close();
-          process.exit(0);
-        });
+          process.on("SIGINT", async () => {
+            await server.close();
+            process.exit(0);
+          });
+          process.on("SIGTERM", async () => {
+            await server.close();
+            process.exit(0);
+          });
+        }
       } catch (error) {
         console.error('Failed to start server:', error);
         process.exit(1);

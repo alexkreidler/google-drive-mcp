@@ -194,7 +194,7 @@ Run the container with your credentials and tokens mounted:
 ```bash
 docker run -it \
   -v /path/to/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro \
-  -v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json \
+  -v "$HOME/.config/google-drive-mcp/tokens.json":/config/tokens.json \
   google-drive-mcp
 ```
 
@@ -206,7 +206,35 @@ docker run -it \
 
 ### Docker Configuration for Claude Desktop
 
-Add this configuration to use the Docker container with Claude Desktop:
+#### Option A: Reusable container (recommended)
+
+Uses a wrapper script that keeps a single named container running and reuses it across client restarts — faster startup and no container churn:
+
+```json
+{
+  "mcpServers": {
+    "google-drive": {
+      "command": "/path/to/google-drive-mcp/scripts/docker-mcp.sh",
+      "env": {
+        "GOOGLE_DRIVE_OAUTH_CREDENTIALS": "$HOME/gcp-oauth.keys.json",
+        "GOOGLE_DRIVE_MCP_TOKEN_PATH": "$HOME/.config/google-drive-mcp/tokens.json"
+      }
+    }
+  }
+}
+```
+
+The script will:
+- Create the container on first run
+- Reuse the existing container on subsequent runs
+- Automatically restart it if it was stopped
+
+**Note:** The container stays running in the background until explicitly stopped.
+To stop it: `docker stop google-drive-mcp`
+
+#### Option B: Fresh container each time
+
+Creates and removes a new container on every client restart:
 
 ```json
 {
@@ -1056,7 +1084,7 @@ ls -la ~/.config/google-drive-mcp/tokens.json
 # 3. Run Docker with tokens mounted
 docker run -it \
   -v $(pwd)/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro \
-  -v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json \
+  -v "$HOME/.config/google-drive-mcp/tokens.json":/config/tokens.json \
   google-drive-mcp
 ```
 
@@ -1081,10 +1109,10 @@ The Dockerfile expects the `dist/` directory to exist from your local build.
 **Solution:** Ensure the token file is mounted with write permissions:
 ```bash
 # Correct: tokens can be updated
--v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json
+-v "$HOME/.config/google-drive-mcp/tokens.json":/config/tokens.json
 
 # Wrong: read-only mount prevents token refresh
--v ~/.config/google-drive-mcp/tokens.json:/config/tokens.json:ro
+-v "$HOME/.config/google-drive-mcp/tokens.json":/config/tokens.json:ro
 ```
 
 ### Debug Mode
